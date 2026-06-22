@@ -41,11 +41,35 @@ val SOME out = Utxo.lookup u2 {txid = Utxo.txid spendTx, index = 0}
 val n        = Utxo.size u2   (* 1 *)
 ```
 
+## Example
+
+`make example` builds and runs [`examples/demo.sml`](examples/demo.sml), which
+builds a small UTXO set from a fixed coinbase, spends it, and reports
+transaction ids, set sizes, output values, and double-spend rejection:
+
+```
+$ make example
+Coinbase transaction:
+  txid = 284CDC60
+  utxo set size = 1
+  output 0 value = 5000
+
+Spend transaction:
+  txid = 7EB71BC5
+  utxo set size = 1
+  coinbase output spent = true
+  new output 0 value = 4000
+
+Double-spend attempt of the spent coinbase output:
+  result = rejected (DoubleSpend)
+```
+
 ## Testing
 
 ```
 make test       # MLton
 make test-poly  # Poly/ML
+make example    # build + run the demo
 ```
 
 ## License
