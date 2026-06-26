@@ -11,9 +11,8 @@ struct
 
   exception DoubleSpend
   exception Overspend
-  exception InvalidTx
+  exception InvalidTx of string
 
-  (* UTXO set as sorted association list: (outpoint * txout) list *)
   type utxo = (outpoint * txout) list
 
   fun cmpOutpoint (a : outpoint, b : outpoint) =
@@ -27,7 +26,20 @@ struct
       NONE => NONE
     | SOME (_, v) => SOME v
 
+  fun member set pt = Option.isSome (lookup set pt)
+
   fun size (set : utxo) : int = List.length set
+
+  fun toList (set : utxo) = set
+  fun outpointsOf (set : utxo) = List.map #1 set
+
+  fun totalValue (set : utxo) : IntInf.int =
+    List.foldl (fn ((_, v), acc) => IntInf.+ (acc, #value v)) (IntInf.fromInt 0) set
+
+  fun balance (set : utxo) pred : IntInf.int =
+    List.foldl (fn ((_, v), acc) =>
+                   if pred (#scriptPubKey v) then IntInf.+ (acc, #value v) else acc)
+               (IntInf.fromInt 0) set
 
   fun insertSorted (k : outpoint) (v : txout) [] = [(k, v)]
     | insertSorted k v ((k2, v2) :: rest) =
@@ -55,32 +67,52 @@ struct
   fun serializeOutpoint (pt : outpoint) =
     #txid pt ^ ":" ^ Int.toString (#index pt)
 
+  (* Fold the scriptPubKey of each output into the txid so that two transactions
+     spending the same inputs to the same amounts but different recipients get
+     distinct ids. *)
   fun txid (tx : tx) : txid =
     let
       val inStr  = String.concat (List.map (fn i => serializeOutpoint (#prevout i)) (#inputs tx))
-      val outStr = String.concat (List.map (fn outp => IntInf.toString (#value outp)) (#outputs tx))
+      val outStr = String.concat
+        (List.map (fn outp => IntInf.toString (#value outp) ^ "|" ^ #scriptPubKey outp ^ ";")
+                  (#outputs tx))
     in
-      simpleHash (inStr ^ outStr)
+      simpleHash (inStr ^ "#" ^ outStr)
     end
 
   fun sumValues (outs : txout list) : IntInf.int =
     List.foldl (fn (outp, acc) => IntInf.+ (acc, #value outp)) (IntInf.fromInt 0) outs
 
+  (* ---- validation ---- *)
+
+  fun validate (tx : tx) : unit =
+    let
+      val () = if List.null (#outputs tx) then raise InvalidTx "no outputs" else ()
+      val () = List.app (fn outp =>
+                 if IntInf.<= (#value outp, IntInf.fromInt 0)
+                 then raise InvalidTx "non-positive output value" else ()) (#outputs tx)
+      (* duplicate inputs (same outpoint twice) *)
+      fun hasDup [] = false
+        | hasDup (x :: xs) =
+            List.exists (fn y => cmpOutpoint (#prevout x, #prevout y) = EQUAL) xs
+            orelse hasDup xs
+      val () = if hasDup (#inputs tx) then raise InvalidTx "duplicate input" else ()
+    in () end
+
+  fun addOutputs newTxid outs set =
+    let
+      fun addOut (outp, (i, acc)) =
+        (i + 1, insertSorted { txid = newTxid, index = i } outp acc)
+      val (_, set') = List.foldl addOut (0, set) outs
+    in set' end
+
   fun apply (set : utxo) (tx : tx) : utxo =
     let
+      val () = validate tx
       val isCoinbase = List.null (#inputs tx)
+      val newTxid = txid tx
     in
-      if isCoinbase
-      then
-        let
-          val newTxid = txid tx
-          fun addOut (outp, (i, acc)) =
-            let val pt = {txid = newTxid, index = i}
-            in (i + 1, insertSorted pt outp acc) end
-          val (_, newSet) = List.foldl addOut (0, set) (#outputs tx)
-        in
-          newSet
-        end
+      if isCoinbase then addOutputs newTxid (#outputs tx) set
       else
         let
           fun spendInput (inp, (acc, inVal)) =
@@ -97,13 +129,27 @@ struct
             List.foldl spendInput (set, IntInf.fromInt 0) (#inputs tx)
           val outputTotal = sumValues (#outputs tx)
           val () = if IntInf.< (inputTotal, outputTotal) then raise Overspend else ()
-          val newTxid = txid tx
-          fun addOut (outp, (i, acc)) =
-            let val pt = {txid = newTxid, index = i}
-            in (i + 1, insertSorted pt outp acc) end
-          val (_, finalSet) = List.foldl addOut (0, set') (#outputs tx)
         in
-          finalSet
+          addOutputs newTxid (#outputs tx) set'
         end
     end
+
+  fun tryApply set tx = SOME (apply set tx) handle _ => NONE
+
+  fun fee (set : utxo) (tx : tx) : IntInf.int =
+    if List.null (#inputs tx) then IntInf.fromInt 0
+    else
+      let
+        val inTotal =
+          List.foldl (fn (inp, acc) =>
+              case lookup set (#prevout inp) of
+                  NONE => raise DoubleSpend
+                | SOME txoutp => IntInf.+ (acc, #value txoutp))
+            (IntInf.fromInt 0) (#inputs tx)
+        val outTotal = sumValues (#outputs tx)
+      in IntInf.- (inTotal, outTotal) end
+
+  fun applyBlock set txs = List.foldl (fn (tx, acc) => apply acc tx) set txs
+
+  fun tryApplyBlock set txs = SOME (applyBlock set txs) handle _ => NONE
 end
